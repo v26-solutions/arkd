@@ -5,10 +5,12 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -22,11 +24,13 @@ import (
 	"github.com/arkade-os/arkd/pkg/ark-lib/txutils"
 	arksdk "github.com/arkade-os/go-sdk"
 	"github.com/arkade-os/go-sdk/client"
+	"github.com/arkade-os/go-sdk/explorer"
 	mempool_explorer "github.com/arkade-os/go-sdk/explorer/mempool"
 	"github.com/arkade-os/go-sdk/indexer"
 	"github.com/arkade-os/go-sdk/redemption"
 	inmemorystoreconfig "github.com/arkade-os/go-sdk/store/inmemory"
 	"github.com/arkade-os/go-sdk/types"
+	"github.com/arkade-os/go-sdk/wallet"
 	singlekeywallet "github.com/arkade-os/go-sdk/wallet/singlekey"
 	inmemorystore "github.com/arkade-os/go-sdk/wallet/singlekey/store/inmemory"
 	"github.com/btcsuite/btcd/btcec/v2"
@@ -2581,65 +2585,354 @@ func TestSweep(t *testing.T) {
 	})
 }
 
-// TestCollisionBetweenInRoundAndRedeemVtxo tests for a potential collision between VTXOs that
-// could occur due to a race condition between simultaneous Settle and SubmitRedeemTx calls.
-// The race condition doesn't consistently reproduce, making the test unreliable in automated test
-// suites. Therefore, the test is skipped by default and left here as documentation for future
-// debugging and reference.
-func TestCollisionBetweenInRoundAndRedeemVtxo(t *testing.T) {
-	t.Skip()
-
-	ctx := t.Context()
-	alice := setupArkSDK(t)
-	bob := setupArkSDK(t)
-
-	faucetOffchain(t, alice, 0.00005)
-
-	_, bobAddr, _, err := bob.Receive(ctx)
+func prepareRegisterIntent(
+	t *testing.T,
+	wallet wallet.WalletService,
+	explorer explorer.Explorer,
+	signerPubKey *btcec.PublicKey,
+	coin types.Vtxo) (string, string) {
+	_, offchainAddrs, _, _, err := wallet.GetAddresses(t.Context())
 	require.NoError(t, err)
 
-	// Test collision when first Settle is called
-	type resp struct {
-		txid string
-		err  error
-	}
-
-	ch := make(chan resp, 2)
-	wg := &sync.WaitGroup{}
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
-		txid, err := alice.Settle(ctx)
-		ch <- resp{txid, err}
-	}()
-	// SDK Settle call is bit slower than Redeem so we introduce small delay so we make sure Settle is called before Redeem
-	// this timeout can vary depending on the environment
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		defer wg.Done()
-		txid, err := alice.SendOffChain(ctx, false, []types.Receiver{{To: bobAddr, Amount: 1000}})
-		ch <- resp{txid, err}
-	}()
-
-	go func() {
-		wg.Wait()
-		close(ch)
-	}()
-
-	finalResp := resp{}
-	for resp := range ch {
-		if resp.err != nil {
-			finalResp.err = resp.err
-		} else {
-			finalResp.txid = resp.txid
+	var tapscripts []string = nil
+	for _, offchainAddr := range offchainAddrs {
+		vtxoAddr, err := coin.Address(signerPubKey, arklib.BitcoinRegTest)
+		require.NoError(t, err)
+		if vtxoAddr == offchainAddr.Address {
+			tapscripts = offchainAddr.Tapscripts
+			break
 		}
 	}
+	require.NotNil(t, tapscripts)
 
-	t.Log(finalResp.err)
-	require.NotEmpty(t, finalResp.txid)
-	require.Error(t, finalResp.err)
+	outpointHash, err := chainhash.NewHashFromStr(coin.Txid)
+	require.NoError(t, err)
+	outpoint := wire.NewOutPoint(outpointHash, coin.VOut)
+	vtxoScript, err := script.ParseVtxoScript(tapscripts)
+	require.NoError(t, err)
 
+	forfeitClosures := vtxoScript.ForfeitClosures()
+	require.Greater(t, len(forfeitClosures), 0)
+
+	forfeitClosure := forfeitClosures[0]
+	forfeitScript, err := forfeitClosure.Script()
+	require.NoError(t, err)
+
+	taprootKey, taprootTree, err := vtxoScript.TapTree()
+	require.NoError(t, err)
+
+	forfeitLeaf := txscript.NewBaseTapLeaf(forfeitScript)
+	leafProof, err := taprootTree.GetTaprootMerkleProof(forfeitLeaf.TapHash())
+	require.NoError(t, err)
+	pkScript, err := script.P2TRScript(taprootKey)
+	require.NoError(t, err)
+	input := intent.Input{
+		OutPoint: outpoint,
+		Sequence: wire.MaxTxInSequenceNum,
+		WitnessUtxo: &wire.TxOut{
+			Value:    int64(coin.Amount),
+			PkScript: pkScript,
+		},
+	}
+
+	var derivationBuf bytes.Buffer
+	derivationBuf.WriteString(outpoint.Hash.String())
+	derivationBuf.WriteString(strconv.Itoa(int(outpoint.Index)))
+	derivationHash := sha256.Sum256(derivationBuf.Bytes())
+	derivationPath := "m"
+	for i := range 8 {
+		// Convert 4 bytes to uint32 using big-endian encoding
+		segment := binary.BigEndian.Uint32(derivationHash[i*4 : (i+1)*4])
+		derivationPath += fmt.Sprintf("/%d'", segment)
+	}
+
+	signerSession, err := wallet.NewVtxoTreeSigner(t.Context(), derivationPath)
+	signerSessionPublicKey := signerSession.GetPublicKey()
+	_, receiveOffchainAddr, _, err := wallet.NewAddress(t.Context(), false)
+	require.NoError(t, err)
+	receiver := types.Receiver{
+		To:     receiveOffchainAddr.Address,
+		Amount: coin.Amount,
+	}
+	validAt := time.Now()
+	expireAt := validAt.Add(2 * time.Minute).Unix()
+	message, err := intent.RegisterMessage{
+		BaseMessage: intent.BaseMessage{
+			Type: intent.IntentMessageTypeRegister,
+		},
+		OnchainOutputIndexes: []int{},
+		ExpireAt:             expireAt,
+		ValidAt:              validAt.Unix(),
+		CosignersPublicKeys:  []string{signerSessionPublicKey},
+	}.Encode()
+	require.NoError(t, err)
+	output, _, err := receiver.ToTxOut()
+	require.NoError(t, err)
+	proof, err := intent.New(message, []intent.Input{input}, []*wire.TxOut{output})
+	require.Equal(t, 2, len(proof.Inputs))
+	proof.Inputs[0].TaprootLeafScript = []*psbt.TaprootTapLeafScript{
+		{
+			ControlBlock: leafProof.ControlBlock,
+			Script:       leafProof.Script,
+			LeafVersion:  txscript.BaseLeafVersion,
+		},
+	}
+	taptreeField, err := txutils.VtxoTaprootTreeField.Encode(tapscripts)
+	require.NoError(t, err)
+	proof.Inputs[1].Unknowns = []*psbt.Unknown{taptreeField}
+	proof.Inputs[1].TaprootLeafScript = []*psbt.TaprootTapLeafScript{
+		{
+			ControlBlock: leafProof.ControlBlock,
+			Script:       leafProof.Script,
+			LeafVersion:  txscript.BaseLeafVersion,
+		},
+	}
+	unsignedProofTx, err := proof.B64Encode()
+	require.NoError(t, err)
+
+	signedTx, err := wallet.SignTransaction(t.Context(), explorer, unsignedProofTx)
+	require.NoError(t, err)
+
+	return signedTx, message
+}
+
+func prepareSubmitTx(
+	t *testing.T,
+	wallet wallet.WalletService,
+	explorer explorer.Explorer,
+	signerPubKey *btcec.PublicKey,
+	checkpointTapscript string,
+	coin types.Vtxo,
+	recipient *wallet.TapscriptsAddress) (string, []string) {
+	require.NotEqual(t, true, coin.Spent)
+
+	_, offchainAddrs, _, _, err := wallet.GetAddresses(t.Context())
+	require.NoError(t, err)
+
+	var tapscripts []string = nil
+	for _, offchainAddr := range offchainAddrs {
+		vtxoAddr, err := coin.Address(signerPubKey, arklib.BitcoinRegTest)
+		require.NoError(t, err)
+		if vtxoAddr == offchainAddr.Address {
+			tapscripts = offchainAddr.Tapscripts
+			break
+		}
+	}
+	require.NotNil(t, tapscripts)
+
+	vtxoScript, err := script.ParseVtxoScript(tapscripts)
+	require.NoError(t, err)
+	forfeitClosure := vtxoScript.ForfeitClosures()[0]
+	forfeitScript, err := forfeitClosure.Script()
+	require.NoError(t, err)
+	forfeitLeaf := txscript.NewBaseTapLeaf(forfeitScript)
+	vtxoTxID, err := chainhash.NewHashFromStr(coin.Txid)
+	require.NoError(t, err)
+	vtxoOutpoint := &wire.OutPoint{
+		Hash:  *vtxoTxID,
+		Index: coin.VOut,
+	}
+	_, vtxoTree, err := vtxoScript.TapTree()
+	require.NoError(t, err)
+	leafProof, err := vtxoTree.GetTaprootMerkleProof(forfeitLeaf.TapHash())
+	require.NoError(t, err)
+	ctrlBlock, err := txscript.ParseControlBlock(leafProof.ControlBlock)
+	require.NoError(t, err)
+	tapscript := &waddrmgr.Tapscript{
+		RevealedScript: leafProof.Script,
+		ControlBlock:   ctrlBlock,
+	}
+	ins := []offchain.VtxoInput{{
+		Outpoint:           vtxoOutpoint,
+		Tapscript:          tapscript,
+		Amount:             int64(coin.Amount),
+		RevealedTapscripts: tapscripts,
+	}}
+
+	toAddr, err := arklib.DecodeAddressV0(recipient.Address)
+	require.NoError(t, err)
+	outVtxoScript, err := script.P2TRScript(toAddr.VtxoTapKey)
+	require.NoError(t, err)
+	outs := []*wire.TxOut{{
+		Value:    int64(coin.Amount),
+		PkScript: outVtxoScript,
+	}}
+
+	serverUnrollScript, err := hex.DecodeString(checkpointTapscript)
+	require.NoError(t, err)
+	arkPtx, checkpointPtxs, err := offchain.BuildTxs(ins, outs, serverUnrollScript)
+	require.NoError(t, err)
+	arkTx, err := arkPtx.B64Encode()
+	require.NoError(t, err)
+	checkpointTxs := make([]string, 0, len(checkpointPtxs))
+	for _, ptx := range checkpointPtxs {
+		tx, err := ptx.B64Encode()
+		require.NoError(t, err)
+		checkpointTxs = append(checkpointTxs, tx)
+	}
+	signedArkTx, err := wallet.SignTransaction(t.Context(), explorer, arkTx)
+
+	return signedArkTx, checkpointTxs
+}
+
+func TestRaceBetweenRegisterIntentAndSubmitTx(t *testing.T) {
+	ctx := t.Context()
+	aliceClient, aliceWallet, _, transport := setupArkSDKwithPublicKey(t)
+	bobClient, bobWallet, _, _ := setupArkSDKwithPublicKey(t)
+
+	info, err := transport.GetInfo(ctx)
+	require.NoError(t, err)
+	signerPubKeyBuf, err := hex.DecodeString(info.SignerPubKey)
+	require.NoError(t, err)
+	signerPubKey, err := btcec.ParsePubKey(signerPubKeyBuf)
+	require.NoError(t, err)
+
+	explorer, err := mempool_explorer.NewExplorer(
+		"http://localhost:3000", arklib.BitcoinRegTest,
+		mempool_explorer.WithTracker(false),
+	)
+	require.NoError(t, err)
+
+	var (
+		registerIntentLatency time.Duration = time.Duration(4) * time.Millisecond
+		submitTxLatency       time.Duration = time.Duration(10) * time.Millisecond
+	)
+
+	if os.Getenv("RACE_TEST_MEASURE_LATENCY") == "1" {
+		warmup := 3
+		timed := 10
+
+		timedRegisterIntentFn := func() (time.Duration, error) {
+			vtxo := faucetOffchain(t, aliceClient, 0.0005)
+			proof, message := prepareRegisterIntent(t, aliceWallet, explorer, signerPubKey, vtxo)
+			start := time.Now()
+			_, err = transport.RegisterIntent(t.Context(), proof, message)
+			elapsed := time.Since(start)
+			return elapsed, err
+		}
+
+		timedSubmitTxFn := func() (time.Duration, error) {
+			vtxo := faucetOffchain(t, bobClient, 0.0005)
+			_, receiveAddr, _, err := aliceWallet.NewAddress(t.Context(), false)
+			require.NoError(t, err)
+			signedTx, checkpointTxs := prepareSubmitTx(t, bobWallet, explorer, signerPubKey, info.CheckpointTapscript, vtxo, receiveAddr)
+			start := time.Now()
+			_, _, _, err = transport.SubmitTx(t.Context(), signedTx, checkpointTxs)
+			elapsed := time.Since(start)
+			return elapsed, err
+		}
+
+		measureMedianLatency := func(fnName string, fn func() (time.Duration, error)) time.Duration {
+			t.Logf("measuring latency for %s", fnName)
+			for i := range warmup {
+				if _, err := fn(); err != nil {
+					t.Logf("measureLatency->%s warmup run %d/%d failed: %v", fnName, i+1, warmup, err)
+				}
+			}
+			durations := make([]time.Duration, 0, timed)
+			for i := range timed {
+				elapsed, err := fn()
+				if err != nil {
+					t.Logf("measureLatency run %d/%d failed: %v", i+1, timed, err)
+					continue
+				}
+				durations = append(durations, elapsed)
+			}
+			if len(durations) == 0 {
+				t.Fatalf("measureLatency->%s: all runs failed", fnName)
+				return 0
+			}
+			slices.Sort(durations)
+			return durations[len(durations)/2]
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			registerIntentLatency = measureMedianLatency("RegisterIntent", timedRegisterIntentFn)
+		}()
+
+		go func() {
+			defer wg.Done()
+			submitTxLatency = measureMedianLatency("SubmitTx", timedSubmitTxFn)
+		}()
+
+		wg.Wait()
+	}
+
+	t.Logf("using register intent latency: %dms", registerIntentLatency.Milliseconds())
+	t.Logf("using submit tx latency: %dms", submitTxLatency.Milliseconds())
+
+	require.Greater(t, submitTxLatency, registerIntentLatency, "it is assumed that submitTx takes longer than registerIntent")
+
+	paramsCollide := func(proof string, unsignedCheckpointTxs []string) bool {
+		proofTx, err := psbt.NewFromRawBytes(strings.NewReader(proof), true)
+		intentProof := intent.Proof{Packet: *proofTx}
+		require.NoError(t, err)
+
+		for _, proofOutpoint := range intentProof.GetOutpoints() {
+			for _, checkpointTx := range unsignedCheckpointTxs {
+				checkpointPtx, err := psbt.NewFromRawBytes(strings.NewReader(checkpointTx), true)
+				require.NoError(t, err)
+				if proofOutpoint.Hash == checkpointPtx.UnsignedTx.TxIn[0].PreviousOutPoint.Hash &&
+					proofOutpoint.Index == checkpointPtx.UnsignedTx.TxIn[0].PreviousOutPoint.Index {
+					return true
+				}
+			}
+		}
+
+		return false
+	}
+
+	delta := submitTxLatency - registerIntentLatency
+	delayMax := int(delta.Milliseconds())
+	delayStep := max(1, delayMax/10) // 1ms or 10% of delta
+	attemptsPerDelay := 10
+
+	for delayMs := 1; delayMs <= delayMax; delayMs += delayStep {
+		for attempt := range attemptsPerDelay {
+			vtxo := faucetOffchain(t, aliceClient, 0.0005)
+			proof, message := prepareRegisterIntent(t, aliceWallet, explorer, signerPubKey, vtxo)
+
+			_, receiveAddr, _, err := bobWallet.NewAddress(t.Context(), false)
+			require.NoError(t, err)
+			signedTx, checkpointTxs := prepareSubmitTx(t, aliceWallet, explorer, signerPubKey, info.CheckpointTapscript, vtxo, receiveAddr)
+
+			require.True(t, paramsCollide(proof, checkpointTxs), "prepared parameters for the same VTXO do not collide")
+
+			var (
+				registerIntentErr error
+				submitTxErr       error
+			)
+
+			var wg sync.WaitGroup
+			wg.Add(2)
+
+			go func() {
+				defer wg.Done()
+				_, _, _, err = transport.SubmitTx(t.Context(), signedTx, checkpointTxs)
+				submitTxErr = err
+			}()
+
+			go func() {
+				defer wg.Done()
+				time.Sleep(time.Duration(delayMs) * time.Millisecond)
+				_, err := transport.RegisterIntent(t.Context(), proof, message)
+				registerIntentErr = err
+			}()
+
+			wg.Wait()
+
+			// The race condition is hit if neither operation returns an error when operating on the same VTXO
+			if registerIntentErr == nil && submitTxErr == nil {
+				t.Fatalf("Race condition hit when calling RegisterIntent after SubmitTx with a %dms delay on attempt %d/%d", delayMs, attempt+1, attemptsPerDelay)
+			}
+
+			t.Logf("Race condition not hit with %dms delay attempt %d/%d", delayMs, attempt+1, attemptsPerDelay)
+		}
+	}
 }
 
 // TestDeleteIntent tests deleting an already registered intent
